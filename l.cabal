@@ -1,0 +1,38 @@
+cabal-version: 3.0
+name:          l
+version:       0.0.0.0
+license:       ISC
+license-file:  LICENSE
+maintainer:    kevin@pnotequalnp.com
+author:        Kevin Mullins
+category:      Language
+build-type:    Simple
+
+executable l
+    main-is:            Main.hs
+    hs-source-dirs:     src
+    other-modules:
+        Core
+        Interpreter
+        Parser
+        Syntax
+        Typechecker
+
+    default-language:   GHC2021
+    default-extensions:
+        BlockArguments DerivingStrategies DuplicateRecordFields LambdaCase
+        NoFieldSelectors OverloadedRecordDot OverloadedStrings PatternSynonyms
+        ViewPatterns
+
+    ghc-options:        -Wall
+    build-depends:
+        base ^>=4.16.3.0,
+        bytestring,
+        containers,
+        megaparsec,
+        parser-combinators,
+        prettyprinter,
+        text,
+        transformers,
+        unordered-containers,
+        vector
