@@ -81,9 +81,8 @@ instance Exception Unhoisted
 
 call :: (Functions, Env) => Function -> Closure -> [Value] -> IO Value
 call Function {params, captures, entry, blocks} closure args = do
-  argVars <- traverse (fmap Value . newIORef) args
   let captureVals = zip captures closure.captures
-      argVals = zip params argVars
+      argVals = zip params args
       initialEnv = IntMap.fromList (captureVals <> argVals)
   env <- readIORef ?env
   writeIORef ?env initialEnv

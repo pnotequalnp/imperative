@@ -86,7 +86,7 @@ instance Pretty Expr where
     Int x -> pretty x
     Float x -> pretty x
     String s -> pretty (show (Text.unpack s))
-    Lambda params body -> "|" <> sep "v" params <> "|" <+> pretty body
+    Lambda params body -> "|" <> sep "x" params <> "|" <+> pretty body
     Intrinsic x -> pretty x
     Val n -> "x" <> pretty n
     Var n -> "v" <> pretty n

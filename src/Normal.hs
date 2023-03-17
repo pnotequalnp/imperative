@@ -252,11 +252,9 @@ intrinsic :: Core.Intrinsic -> Name -> State Int Fun
 intrinsic intr name = do
   let ary = arity intr
   params <- replicateM ary newName
-  rs <- replicateM ary newName
-  let derefs = foldr (.) id (zipWith Deref rs params)
   entryName <- newName
   res <- newName
-  let body = derefs $ Intrinsic res intr (Var <$> rs) $ Return (Var res)
+  let body = Intrinsic res intr (Var <$> params) $ Return (Var res)
       entry = Block {name = entryName, slot = Nothing, body}
       blocks = NE.singleton entry
   pure Fun {name, params, captures, blocks}

@@ -414,7 +414,14 @@ fun params retTy body = do
   body' <- withReturn retTy (withEnv env (check retTy body))
   let params'' = (\(_, (n, _)) -> n) <$> params'
       ty = TFunction (snd . snd <$> params') retTy
-  pure (Core.Lambda params'' body', ty)
+  paramVars <- for params'' \p -> do
+    name <- nextName
+    pure (name, Core.Decl p (Core.Val name))
+  let (paramVals, decls) = unzip paramVars
+      body'' = case body' of
+        Core.Block ss x -> Core.Block (decls <> ss) x
+        _ -> Core.Block decls body'
+  pure (Core.Lambda paramVals body'', ty)
 
 data Target
   = NonAssignable
