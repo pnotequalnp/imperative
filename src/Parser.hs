@@ -128,6 +128,7 @@ atom =
   choice
     [ unit <?> "unit"
     , hidden $ between "(" ")" expr
+    , var <?> "variable"
     , bool <?> "boolean"
     , number <?> "number"
     , str <?> "string"
@@ -142,7 +143,6 @@ atom =
     , hidden fun
     , hidden alias
     , block <?> "block"
-    , var <?> "variable"
     ]
 
 unit :: Parser Expr
@@ -265,7 +265,7 @@ block = do
   pure (Block stmts)
 
 var :: Parser Expr
-var = Var <$> ident
+var = Var <$> try ident
 
 entry :: Parser a -> Lazy.Text -> Parser (Strict.Text, a)
 entry p sep = do

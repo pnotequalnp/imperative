@@ -15,7 +15,7 @@ data Type
   | TArray Type
   | TObject [(Field, Type)]
   | TFunction [Type] Type
-  deriving stock (Show, Eq)
+  deriving stock (Show, Eq, Ord)
 
 data Expr
   = Unit

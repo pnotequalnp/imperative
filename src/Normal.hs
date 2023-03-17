@@ -8,6 +8,8 @@ module Normal (
   normalize,
 ) where
 
+import Control.Monad (replicateM)
+import Control.Monad.Trans.Accum (AccumT, add, look, runAccumT)
 import Control.Monad.Trans.Class (lift)
 import Control.Monad.Trans.Cont (ContT (..), mapContT)
 import Control.Monad.Trans.State.Strict (State, evalState, get, put)
@@ -17,6 +19,8 @@ import Data.IntSet (IntSet)
 import Data.IntSet qualified as IntSet
 import Data.List.NonEmpty (NonEmpty (..))
 import Data.List.NonEmpty qualified as NE
+import Data.Map.Strict (Map)
+import Data.Map.Strict qualified as Map
 import Data.Text (Text)
 import Data.Text qualified as Text
 import Prettyprinter (Pretty (..), (<+>))
@@ -48,7 +52,7 @@ data Expr
   | Return Atom
   | Halt
 
-type Norm r = ContT r (State Int)
+type Norm r = ContT r (AccumT (Map Core.Intrinsic Name) (State Int))
 
 newName :: State Int Name
 newName = do
@@ -60,8 +64,10 @@ normalize :: Int -> [Core.Expr] -> NonEmpty Fun
 normalize n ss = evalState go n
   where
     go = do
-      x <- runContT (traverse_ norm ss) (\_ -> pure Halt)
-      hoist x
+      (x, intrinsics) <- runAccumT (runContT (traverse_ norm ss) (\_ -> pure Halt)) Map.empty
+      intrinsicFuns <- traverse (uncurry intrinsic) (Map.toList intrinsics)
+      funs <- hoist x
+      pure (funs `NE.appendList` intrinsicFuns)
 
 norm :: Core.Expr -> Norm Expr Atom
 norm = \case
@@ -71,38 +77,44 @@ norm = \case
   Core.Float x -> pure (Float x)
   Core.String s -> pure (String s)
   Core.Lambda params body -> do
-    name <- lift newName
+    name <- newName'
     with (Var name) \k -> do
       body' <- runContT (norm body) (pure . Return)
       pure (Lambda name params body' k)
   Core.Intrinsic x -> do
-    c <- lift newName
-    f <- lift newName
+    c <- newName'
+    intrinsics <- lift look
+    f <- case Map.lookup x intrinsics of
+      Just name -> pure name
+      Nothing -> do
+        name <- newName'
+        lift (add (Map.singleton x name))
+        pure name
     with (Var c) \k -> pure (Closure c f [] k)
   Core.Val name -> pure (Var name)
   Core.Var name -> do
-    x <- lift newName
+    x <- newName'
     with (Var x) \k -> pure (Deref x name k)
   Core.Call (Core.Intrinsic x) args -> do
     args' <- traverse norm args
-    result <- lift newName
+    result <- newName'
     with (Var result) \k -> pure (Intrinsic result x args' k)
   Core.Call f args -> do
     f' <- norm f
     args' <- traverse norm args
-    result <- lift newName
+    result <- newName'
     with (Var result) \k -> pure (Call result f' args' k)
   Core.Cond cond true false -> do
     cond' <- norm cond
-    slot <- lift newName
+    slot <- newName'
     with (Var slot) \k -> do
-      join <- newName
+      join <- lift newName
       let jump v = pure (Jump join (Just v))
       true' <- runContT (norm true) jump
       false' <- runContT (norm false) jump
       pure (Join join (Just slot) (Cond cond' true' false') k)
   Core.While cond body -> do
-    loop <- lift newName
+    loop <- newName'
     with Unit \k -> do
       body' <- runContT (traverse_ norm body) \_ -> pure (Jump loop Nothing)
       entry <- runContT (norm cond) \b -> pure (Cond b body' k)
@@ -123,6 +135,7 @@ norm = \case
     traverse_ norm ss
     norm x
   where
+    newName' = lift (lift newName)
     with x f = mapContT (>>= f) (pure x)
     bindA name value = \case
       Var n | n == name -> value
@@ -234,6 +247,38 @@ hoist e = do
       jmp@Jump {} -> pure jmp
       ret@Return {} -> pure ret
       hlt@Halt -> pure hlt
+
+intrinsic :: Core.Intrinsic -> Name -> State Int Fun
+intrinsic intr name = do
+  let ary = arity intr
+  params <- replicateM ary newName
+  rs <- replicateM ary newName
+  let derefs = foldr (.) id (zipWith Deref rs params)
+  entryName <- newName
+  res <- newName
+  let body = derefs $ Intrinsic res intr (Var <$> rs) $ Return (Var res)
+      entry = Block {name = entryName, slot = Nothing, body}
+      blocks = NE.singleton entry
+  pure Fun {name, params, captures, blocks}
+  where
+    captures = []
+    arity = \case
+      Core.Arith {} -> 2
+      Core.Modulo {} -> 2
+      Core.Cast {} -> 1
+      Core.Compare {} -> 2
+      Core.Logic {} -> 2
+      Core.StringAppend {} -> 2
+      Core.NewArray {} -> 1
+      Core.ArrayLength {} -> 1
+      Core.ReadArray {} -> 2
+      Core.WriteArray {} -> 3
+      Core.NewObject {} -> 0
+      Core.ReadObject {} -> 1
+      Core.WriteObject {} -> 2
+      Core.ToString {} -> 1
+      Core.WriteStdout {} -> 1
+      Core.ReadStdinLine {} -> 0
 
 instance Pretty Expr where
   pretty = \case

@@ -48,12 +48,16 @@ data Expr
   | Block [Stmt] Expr
 
 data Number = NInt | NFloat
+  deriving stock (Eq, Ord)
 
 data Arith = Plus | Minus | Times | Divide
+  deriving stock (Eq, Ord)
 
 data Comparison = Lt | Lte | Eq | Neq | Gte | Gt
+  deriving stock (Eq, Ord)
 
 data Logic = And | Or
+  deriving stock (Eq, Ord)
 
 data Intrinsic
   = Arith Arith Number
@@ -72,6 +76,7 @@ data Intrinsic
   | ToString Type
   | WriteStdout
   | ReadStdinLine
+  deriving stock (Eq, Ord)
 
 instance Pretty Expr where
   pretty = \case
