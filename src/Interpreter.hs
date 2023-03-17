@@ -4,31 +4,40 @@
 module Interpreter (interpret) where
 
 import Control.Exception (Exception, catch, throwIO)
-import Data.Bitraversable (bitraverse)
-import Data.Foldable (traverse_)
-import Data.Functor ((<&>))
-import Data.HashMap.Strict (HashMap)
+import Data.Functor (void)
 import Data.HashMap.Strict qualified as HashMap
-import Data.IORef (IORef, modifyIORef, newIORef, readIORef, writeIORef)
+import Data.IORef (IORef, modifyIORef', newIORef, readIORef, writeIORef)
 import Data.IntMap.Strict (IntMap)
 import Data.IntMap.Strict qualified as IntMap
-import Data.Text (Text)
+import Data.List.NonEmpty (NonEmpty (..))
 import Data.Text qualified as Text
 import Data.Text.IO qualified as Text
-import Data.Vector qualified as Vector
 import Data.Vector.Mutable qualified as MVector
 import Data.Vector.Unboxed qualified as UVector
 import Data.Vector.Unboxed.Mutable qualified as UMVector
 import GHC.Exts (Any)
 import Unsafe.Coerce (unsafeCoerce)
 
-import Core
+import Core (Arith (..), Comparison (..), Logic (..), Number (..), Type (..), Field)
+import Normal
 
-interpret :: [Expr] -> IO ()
-interpret ss = do
+interpret :: NonEmpty Fun -> IO ()
+interpret (main :| funs) = do
+  let functions = preprocess (main : funs)
+      main' = functions IntMap.! main.name
+      closure = MkClosure {function = main', captures = []}
+
   env <- newIORef IntMap.empty
+
   let ?env = env
-  traverse_ eval ss
+      ?functions = functions
+
+  void (call main' closure []) `catch` \Done -> pure ()
+
+data Done = Done
+  deriving stock (Show)
+
+instance Exception Done
 
 newtype Value = MkValue Any
 
@@ -41,164 +50,178 @@ pattern Value x <- (unsafeCoerce -> x)
 extract :: forall a. Value -> a
 extract (Value x) = x
 
-type Array = MVector.IOVector Value
+data Closure = MkClosure
+  { function :: Function
+  , captures :: [Value]
+  }
 
-type Object = IORef (HashMap Field Value)
+data Function = Function
+  { params :: [Name]
+  , captures :: [Name]
+  , entry :: Expr
+  , blocks :: IntMap Block
+  }
 
-type Env = ?env :: IORef (IntMap (IORef Value))
+type Functions = ?functions :: IntMap Function
+type Blocks = ?blocks :: IntMap Block
+type Env = ?env :: IORef (IntMap Value)
+type Eval = (Functions, Blocks, Env)
 
-makeArray :: forall a. UVector.Unbox a => [Value] -> IO Value
-makeArray xs = do
-  let v = UVector.fromList (extract @a <$> xs)
-  mv <- UVector.thaw v
-  pure (Value mv)
+preprocess :: [Fun] -> IntMap Function
+preprocess =
+  IntMap.fromList . fmap \Fun {name, captures, params, blocks = entry :| blocks} ->
+    (name, Function {params, captures, entry = entry.body, blocks = processBlocks (entry : blocks)})
+  where
+    processBlocks = IntMap.fromList . fmap \block -> (block.name, block)
 
-makeBoxedArray :: [Value] -> IO Value
-makeBoxedArray = fmap Value . Vector.thaw . Vector.fromList
+data Unhoisted = Unhoisted
+  deriving stock (Show)
 
-makeVar :: Env => Tag -> Value -> IO ()
-makeVar (Tag k) v = do
-  var <- newIORef v
-  modifyIORef ?env (IntMap.insert k var)
+instance Exception Unhoisted
 
-makeVars :: Env => [(Tag, Value)] -> IO ()
-makeVars vals = do
-  vars <- traverse (bitraverse (\(Tag k) -> pure k) newIORef) vals
-  modifyIORef ?env (IntMap.fromList vars <>)
+call :: (Functions, Env) => Function -> Closure -> [Value] -> IO Value
+call Function {params, captures, entry, blocks} closure args = do
+  argVars <- traverse (fmap Value . newIORef) args
+  let captureVals = zip captures closure.captures
+      argVals = zip params argVars
+      initialEnv = IntMap.fromList (captureVals <> argVals)
+  env <- readIORef ?env
+  writeIORef ?env initialEnv
+  r <-
+    let ?blocks = blocks
+     in eval entry
+  writeIORef ?env env
+  pure r
 
-newtype Return = Ret Value
-
-instance Show Return where
-  show _ = "<return>"
-
-instance Exception Return
-
-eval :: Env => Expr -> IO Value
+eval :: Eval => Expr -> IO Value
 eval = \case
+  Closure name f captureNames k -> do
+    captures <- traverse getName captureNames
+    let fun = ?functions IntMap.! f
+        closure = MkClosure {function = fun, captures}
+    bind name (Value closure)
+    eval k
+  Call name f args k -> do
+    Value closure <- immediate f
+    args' <- traverse immediate args
+    r <- call closure.function closure args'
+    bind name r
+    eval k
+  Intrinsic name x args k -> do
+    args' <- traverse immediate args
+    r <- intrinsic args' x
+    bind name r
+    eval k
+  Decl name value k -> do
+    v <- immediate value
+    var <- newIORef v
+    bind name (Value var)
+    eval k
+  Assign name value k -> do
+    v <- immediate value
+    Value var <- getName name
+    writeIORef var v
+    eval k
+  Deref name v k -> do
+    Value var <- getName v
+    r <- readIORef var
+    bind name r
+    eval k
+  Branch cond true false -> do
+    Value b <- immediate cond
+    let block = ?blocks IntMap.! if b then true else false
+    eval block.body
+  Jump block arg -> do
+    let Block {slot, body} = ?blocks IntMap.! block
+    case (arg, slot) of
+      (Just value, Just name) -> do
+        v <- immediate value
+        bind name v
+      _ -> pure ()
+    eval body
+  Return value -> immediate value
+  Halt -> throwIO Done
+  Lambda {} -> throwIO Unhoisted
+  Join {} -> throwIO Unhoisted
+  Cond {} -> throwIO Unhoisted
+
+immediate :: Env => Atom -> IO Value
+immediate = \case
+  Var name -> getName name
   Unit -> pure (Value ())
   Bool b -> pure (Value b)
   Int x -> pure (Value x)
   Float x -> pure (Value x)
   String s -> pure (Value s)
-  Array t xs -> do
-    xs' <- traverse eval xs
-    case t of
-      TUnit -> makeArray @() xs'
-      TBool -> makeArray @Bool xs'
-      TFloat -> makeArray @Double xs'
-      TInt -> makeArray @Int xs'
-      _ -> makeBoxedArray xs'
-  Object fields -> do
-    fields' <- traverse (traverse eval) fields
-    obj <- newIORef (HashMap.fromList fields')
-    pure (Value obj)
-  Lambda captures params body -> do
-    env <- readIORef ?env
-    let captured = captures <&> \(Tag k) -> (k, env IntMap.! k)
-    local <- newIORef (IntMap.fromList captured)
-    let close =
-          let ?env = local
-           in let make args [] = Value do makeVars args; eval body
-                  make args (p : ps) = Value \v -> extract (make ((p, v) : args) ps)
-               in make []
-    pure (close params)
-  Var (Name (Tag k)) -> do
-    env <- readIORef ?env
-    -- putStrLn ""
-    -- print k
-    -- print (IntMap.keys env)
-    readIORef (env IntMap.! k)
-  Var (Intrinsic x) -> pure (intrinsic x)
-  Call f args -> do
-    f' <- eval f
-    args' <- traverse eval args
-    call f' args' `catch` \(Ret v) -> pure v
-    where
-      call g [] = extract g
-      call g (x : xs) = call (extract g x) xs
-  Cond cond true false -> do
-    Value b <- eval cond
-    if b
-      then eval true
-      else eval false
-  Loop cond body -> loop
-    where
-      loop = do
-        Value b <- eval cond
-        if b
-          then do traverse_ eval body; loop
-          else pure (Value ())
-  Return x -> do
-    v <- eval x
-    throwIO (Ret v)
-  Decl tag body -> do
-    v <- eval body
-    makeVar tag v
-    pure (Value ())
-  Assign (Tag k) x -> do
-    env <- readIORef ?env
-    let var = env IntMap.! k
-    v <- eval x
-    writeIORef var v
-    pure (Value ())
-  Block ss x -> do
-    env <- readIORef ?env
-    traverse_ eval ss
-    v <- eval x
-    writeIORef ?env env
-    pure v
 
-intrinsic :: Intrinsic -> Value
-intrinsic = \case
-  Arith Plus NInt -> Value (arith ((+) @Int))
-  Arith Minus NInt -> Value (arith ((-) @Int))
-  Arith Times NInt -> Value (arith ((*) @Int))
-  Arith Divide NInt -> Value (arith (div @Int))
-  Arith Plus NFloat -> Value (arith ((+) @Double))
-  Arith Minus NFloat -> Value (arith ((-) @Double))
-  Arith Times NFloat -> Value (arith ((*) @Double))
-  Arith Divide NFloat -> Value (arith ((/) @Double))
-  Modulo -> Value (arith (mod @Int))
-  Cast NInt NInt -> Value (cast (id @Int))
-  Cast NInt NFloat -> Value (cast (fromIntegral @Int @Double))
-  Cast NFloat NInt -> Value (cast (floor @Double @Int))
-  Cast NFloat NFloat -> Value (cast (id @Double))
-  Compare Lt NInt -> Value (comp ((<) @Int))
-  Compare Lte NInt -> Value (comp ((<=) @Int))
-  Compare Eq NInt -> Value (comp ((==) @Int))
-  Compare Neq NInt -> Value (comp ((/=) @Int))
-  Compare Gte NInt -> Value (comp ((>=) @Int))
-  Compare Gt NInt -> Value (comp ((>) @Int))
-  Compare Lt NFloat -> Value (comp ((<) @Double))
-  Compare Lte NFloat -> Value (comp ((<=) @Double))
-  Compare Eq NFloat -> Value (comp ((==) @Double))
-  Compare Neq NFloat -> Value (comp ((/=) @Double))
-  Compare Gte NFloat -> Value (comp ((>=) @Double))
-  Compare Gt NFloat -> Value (comp ((>) @Double))
-  Logic And -> Value (logic (&&))
-  Logic Or -> Value (logic (||))
-  StringAppend -> Value \x y -> pure @IO (extract @Text x <> extract @Text y)
-  ArrayLength TUnit -> Value (arrayLength @())
-  ArrayLength TBool -> Value (arrayLength @Bool)
-  ArrayLength TInt -> Value (arrayLength @Int)
-  ArrayLength TFloat -> Value (arrayLength @Double)
-  ArrayLength _ -> Value \(Value v) -> pure @IO (Value (MVector.length v))
-  ReadArray TUnit -> Value (readArray @())
-  ReadArray TBool -> Value (readArray @Bool)
-  ReadArray TInt -> Value (readArray @Int)
-  ReadArray TFloat -> Value (readArray @Double)
-  ReadArray _ -> Value \(Value v) (Value ix) -> MVector.read @IO v ix
-  WriteArray TUnit -> Value (writeArray @())
-  WriteArray TBool -> Value (writeArray @Bool)
-  WriteArray TInt -> Value (writeArray @Int)
-  WriteArray TFloat -> Value (writeArray @Double)
-  WriteArray _ -> Value \(Value v) (Value ix) (Value x) -> Value () <$ MVector.write @IO v ix x
-  ToString TInt -> Value \(Value (x :: Int)) -> pure @IO (Text.pack (show x))
-  ToString _ -> _toString
-  WriteStdout -> Value \(Value s) -> Value () <$ Text.putStrLn s
-  ReadStdinLine -> Value (Value <$> Text.getLine)
-  ReadObject field -> Value \(Value (obj :: Object)) -> (HashMap.! field) <$> readIORef obj
-  WriteObject field -> Value \(Value obj) (x :: Value) -> Value () <$ modifyIORef obj (HashMap.insert field x)
+getName :: Env => Name -> IO Value
+getName name = (IntMap.! name) <$> readIORef ?env
+
+bind :: Env => Name -> Value -> IO ()
+bind name value = modifyIORef' ?env (IntMap.insert name value)
+
+data IntrinsicArity = IntrinsicArity
+  deriving stock (Show)
+
+instance Exception IntrinsicArity
+
+intrinsic :: [Value] -> Intrinsic -> IO Value
+intrinsic args = \case
+  Arith Plus NInt | [x, y] <- args -> arith ((+) @Int) x y
+  Arith Minus NInt | [x, y] <- args -> arith ((-) @Int) x y
+  Arith Times NInt | [x, y] <- args -> arith ((*) @Int) x y
+  Arith Divide NInt | [x, y] <- args -> arith (div @Int) x y
+  Arith Plus NFloat | [x, y] <- args -> arith ((+) @Double) x y
+  Arith Minus NFloat | [x, y] <- args -> arith ((-) @Double) x y
+  Arith Times NFloat | [x, y] <- args -> arith ((*) @Double) x y
+  Arith Divide NFloat | [x, y] <- args -> arith (div @Int) x y
+  Modulo | [x, y] <- args -> arith (mod @Int) x y
+  Cast NInt NInt | [x] <- args -> cast (id @Int) x
+  Cast NInt NFloat | [x] <- args -> cast (fromIntegral @Int @Double) x
+  Cast NFloat NInt | [x] <- args -> cast (round @Double @Int) x
+  Cast NFloat NFloat | [x] <- args -> cast (id @Double) x
+  Compare Lt NInt | [x, y] <- args -> comp ((<) @Int) x y
+  Compare Lte NInt | [x, y] <- args -> comp ((<=) @Int) x y
+  Compare Eq NInt | [x, y] <- args -> comp ((==) @Int) x y
+  Compare Neq NInt | [x, y] <- args -> comp ((/=) @Int) x y
+  Compare Gte NInt | [x, y] <- args -> comp ((>=) @Int) x y
+  Compare Gt NInt | [x, y] <- args -> comp ((>) @Int) x y
+  Compare Lt NFloat | [x, y] <- args -> comp ((<) @Double) x y
+  Compare Lte NFloat | [x, y] <- args -> comp ((<=) @Double) x y
+  Compare Eq NFloat | [x, y] <- args -> comp ((==) @Double) x y
+  Compare Neq NFloat | [x, y] <- args -> comp ((/=) @Double) x y
+  Compare Gte NFloat | [x, y] <- args -> comp ((>=) @Double) x y
+  Compare Gt NFloat | [x, y] <- args -> comp ((>) @Double) x y
+  Logic And | [x, y] <- args -> logic (&&) x y
+  Logic Or | [x, y] <- args -> logic (||) x y
+  StringAppend | [x, y] <- args -> pure (Value (extract x `Text.append` extract y))
+  NewArray TUnit | [len] <- args -> makeArray @() len
+  NewArray TBool | [len] <- args -> makeArray @Bool len
+  NewArray TInt | [len] <- args -> makeArray @Int len
+  NewArray TFloat | [len] <- args -> makeArray @Double len
+  NewArray _ | [len] <- args -> Value <$> MVector.unsafeNew (extract len)
+  ArrayLength TUnit | [xs] <- args -> arrayLength @() xs
+  ArrayLength TBool | [xs] <- args -> arrayLength @Bool xs
+  ArrayLength TInt | [xs] <- args -> arrayLength @Int xs
+  ArrayLength TFloat | [xs] <- args -> arrayLength @Double xs
+  ArrayLength _ | [xs] <- args -> pure (Value (MVector.length (extract xs)))
+  ReadArray TUnit | [xs, ix] <- args -> readArray @() xs ix
+  ReadArray TBool | [xs, ix] <- args -> readArray @Bool xs ix
+  ReadArray TInt | [xs, ix] <- args -> readArray @Int xs ix
+  ReadArray TFloat | [xs, ix] <- args -> readArray @Double xs ix
+  ReadArray _ | [xs, ix] <- args -> Value <$> MVector.unsafeRead (extract xs) (extract ix)
+  WriteArray TUnit | [xs, ix, v] <- args -> writeArray @() xs ix v
+  WriteArray TBool | [xs, ix, v] <- args -> writeArray @Bool xs ix v
+  WriteArray TInt | [xs, ix, v] <- args -> writeArray @Int xs ix v
+  WriteArray TFloat | [xs, ix, v] <- args -> writeArray @Double xs ix v
+  WriteArray _ | [xs, ix, v] <- args -> Value () <$ MVector.unsafeWrite (extract xs) (extract ix) (extract v)
+  NewObject | [] <- args -> Value <$> newIORef (HashMap.empty @Field @Value)
+  ReadObject field | [obj] <- args -> (HashMap.! field) <$> readIORef (extract obj)
+  WriteObject field | [obj, v] <- args -> Value () <$ modifyIORef' (extract obj) (HashMap.insert field v)
+  ToString TInt | [x] <- args -> (pure . Value . Text.pack . show @Int . extract) x
+  WriteStdout | [s] <- args -> Value () <$ Text.putStr (extract s)
+  ReadStdinLine | [] <- args -> Value <$> Text.getLine
+  _ -> throwIO IntrinsicArity
   where
     arith :: (a -> a -> a) -> Value -> Value -> IO Value
     arith op (Value x) (Value y) = pure (Value (x `op` y))
@@ -208,6 +231,8 @@ intrinsic = \case
     comp cmp (Value x) (Value y) = pure (Value (x `cmp` y))
     logic :: (Bool -> Bool -> Bool) -> Value -> Value -> IO Value
     logic op (Value x) (Value y) = pure (Value (x `op` y))
+    makeArray :: forall a. UVector.Unbox a => Value -> IO Value
+    makeArray (Value len) = Value <$> UMVector.unsafeNew @_ @a len
     arrayLength :: forall a. UVector.Unbox a => Value -> IO Value
     arrayLength (Value v) = pure (Value (UMVector.length @a v))
     readArray :: forall a. UVector.Unbox a => Value -> Value -> IO Value

@@ -7,6 +7,7 @@ import System.Environment (getArgs)
 import System.Exit (die)
 
 import Interpreter (interpret)
+import Normal (normalize)
 import Parser (parse)
 import Typechecker (typecheck)
 
@@ -24,12 +25,19 @@ main = do
     Left err -> die err
     Right xs -> pure xs
 
-  core <- case typecheck prog of
+  let (res, x) = typecheck prog
+  core <- case res of
     Left err -> die (show err)
     Right core -> pure core
 
-  putStrLn "=== Core ==="
+  putStrLn "===== Core ====="
   traverse_ (print . pretty) core
-  putStrLn "============"
+  putStrLn "================\n"
 
-  interpret core
+  let funs = normalize x core
+
+  putStrLn "==== Normal ===="
+  traverse_ (print . pretty) funs
+  putStrLn "================\n"
+
+  interpret funs

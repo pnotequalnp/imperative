@@ -1,9 +1,6 @@
 module Core (
   -- * Names
-  Name (..),
-  Tag (..),
-  zeroTag,
-  incTag,
+  Name,
   Field,
 
   -- * Expressions
@@ -21,41 +18,33 @@ module Core (
 where
 
 import Data.Text (Text)
-import Prettyprinter (Pretty (..), Doc, (<+>))
+import Data.Text qualified as Text
+import Prettyprinter (Pretty (..), (<+>))
 import Prettyprinter qualified as PP
 
 import Syntax (Field, Type (..))
 
-data Name
-  = Name !Tag
-  | Intrinsic Intrinsic
-
-newtype Tag = Tag Int
-
-zeroTag :: Tag
-zeroTag = Tag 0
-
-incTag :: Tag -> Tag
-incTag (Tag x) = Tag (x + 1)
+type Name = Int
 
 type Stmt = Expr
 
 data Expr
   = Unit
-  | Bool !Bool
+  | Bool Bool
   | Int !Int
   | Float !Double
   | String Text
-  | Array Type [Expr]
-  | Object [(Field, Expr)]
-  | Lambda [Tag] [Tag] Expr
-  | Var Name
+  | Lambda [Name] Expr
+  | Intrinsic Intrinsic
+  | Val !Name
+  | Var !Name
   | Call Expr [Expr]
   | Cond Expr Expr Expr
-  | Loop Expr [Stmt]
+  | While Expr [Stmt]
   | Return Expr
-  | Decl Tag Expr
-  | Assign Tag Expr
+  | Assign !Name Expr
+  | Decl !Name Expr
+  | Bind !Name Expr
   | Block [Stmt] Expr
 
 data Number = NInt | NFloat
@@ -73,9 +62,11 @@ data Intrinsic
   | Compare Comparison Number
   | Logic Logic
   | StringAppend
+  | NewArray Type
   | ArrayLength Type
   | ReadArray Type
   | WriteArray Type
+  | NewObject
   | ReadObject Field
   | WriteObject Field
   | ToString Type
@@ -89,42 +80,41 @@ instance Pretty Expr where
     Bool False -> "false"
     Int x -> pretty x
     Float x -> pretty x
-    String s -> PP.dquotes (pretty s)
-    Array _ xs -> "[" <> PP.hsep (PP.punctuate PP.comma (pretty <$> xs)) <> "]"
-    Object fields -> PP.nest 2 (PP.vsep ("{." : (field <$> fields))) <> PP.line <> ".}"
-      where
-        field (n, x) = pretty n <+> "=" <+> pretty x
-    Lambda captures params body -> "|" <> commaSep params <> "|" <+> PP.brackets (commaSep captures) <+> pretty body
-    Var n -> pretty n
-    Call f args -> pretty f <> PP.parens (commaSep args)
+    String s -> pretty (show (Text.unpack s))
+    Lambda params body -> "|" <> sep "v" params <> "|" <+> pretty body
+    Intrinsic x -> pretty x
+    Val n -> "x" <> pretty n
+    Var n -> "v" <> pretty n
+    Call f args -> pretty f <> PP.parens (sep "" args)
     Cond cond true false -> "if" <+> PP.parens (pretty cond) <+> pretty true <+> "else" <+> pretty false
-    Loop cond body -> "while" <+> PP.parens (pretty cond) <+> PP.nest 2 (PP.vsep ("{" : (pretty <$> body))) <> PP.line <> "}"
+    While cond body -> "while" <+> PP.parens (pretty cond) <+> PP.nest 2 (PP.vsep ("{" : (pretty <$> body))) <> PP.line <> "}"
     Return value -> "return" <+> pretty value
-    Decl n value -> "let" <+> pretty n <+> "=" <+> pretty value
-    Assign n value -> pretty n <+> "=" <+> pretty value
+    Assign n value -> "*v" <> pretty n <+> "=" <+> pretty value
+    Decl n value -> "var" <+> "v" <> pretty n <+> "=" <+> pretty value
+    Bind n value -> "const" <+> "x" <> pretty n <+> "=" <+> pretty value
     Block ss x -> PP.nest 2 (PP.vsep ("{" : (pretty <$> ss) ++ [pretty x])) <> PP.line <> "}"
     where
-      commaSep :: Pretty a => [a] -> Doc ann
-      commaSep = PP.hsep . PP.punctuate PP.comma . fmap pretty
+      sep :: Pretty a => PP.Doc ann -> [a] -> PP.Doc ann
+      sep s xs = PP.hsep (PP.punctuate "," ((s <>) . pretty <$> xs))
 
-instance Pretty Name where
+instance Pretty Intrinsic where
   pretty = \case
-    Name t -> pretty t
-    Intrinsic f -> case f of
-      Arith op n -> pretty op <> "_" <> pretty n
-      Modulo -> "mod"
-      Cast n n' -> pretty n <> "_to_" <> pretty n'
-      Compare cmp n -> pretty cmp <> "_" <> pretty n
-      Logic op -> "logical_" <> pretty op
-      StringAppend -> "string_append"
-      ArrayLength ty -> "array_length_" <> pretty ty
-      ReadArray ty -> "read_" <> pretty ty <> "_array"
-      WriteArray ty -> "write_" <> pretty ty <> "_array"
-      ReadObject field -> "read_field_" <> pretty field
-      WriteObject field -> "write_field_" <> pretty field
-      ToString ty -> pretty ty <> "_to_string"
-      WriteStdout -> "print"
-      ReadStdinLine -> "readLine"
+    Arith op n -> pretty op <> "_" <> pretty n
+    Modulo -> "mod"
+    Cast n n' -> pretty n <> "_to_" <> pretty n'
+    Compare cmp n -> pretty cmp <> "_" <> pretty n
+    Logic op -> "logical_" <> pretty op
+    StringAppend -> "string_append"
+    NewArray ty -> "new_" <> pretty ty <> "_array"
+    ArrayLength ty -> "array_length_" <> pretty ty
+    ReadArray ty -> "read_" <> pretty ty <> "_array"
+    WriteArray ty -> "write_" <> pretty ty <> "_array"
+    NewObject -> "new_object"
+    ReadObject field -> "read_field_" <> pretty field
+    WriteObject field -> "write_field_" <> pretty field
+    ToString ty -> pretty ty <> "_to_string"
+    WriteStdout -> "print"
+    ReadStdinLine -> "readLine"
 
 instance Pretty Comparison where
   pretty = \case
@@ -139,9 +129,6 @@ instance Pretty Logic where
   pretty = \case
     And -> "and"
     Or -> "or"
-
-instance Pretty Tag where
-  pretty (Tag x) = "v" <> pretty x
 
 instance Pretty Type where
   pretty = \case

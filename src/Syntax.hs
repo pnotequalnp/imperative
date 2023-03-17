@@ -40,7 +40,6 @@ data Expr
   | Alias Name Type
   | Assign (Maybe BinOp) Expr Expr
   | Block [Expr]
-  deriving stock (Show)
 
 data BinOp
   = Plus
